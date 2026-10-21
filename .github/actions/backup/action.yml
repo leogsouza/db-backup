@@ -1,0 +1,87 @@
+name: MySQL backup
+description: Build the db-backup image and upload a MySQL dump to an rclone remote.
+
+inputs:
+  host:
+    description: MySQL host reachable from the container
+    required: true
+  user:
+    description: MySQL user
+    required: true
+  database:
+    description: MySQL database to dump
+    required: true
+  remote:
+    description: rclone remote that receives the backup
+    required: true
+  prefix:
+    description: Backup object name prefix
+    required: true
+  keep:
+    description: Days of backups to keep
+    required: false
+    default: "30"
+
+runs:
+  using: composite
+  steps:
+    - name: Require environment
+      shell: bash
+      run: |
+        if [ -z "$DB_PASSWORD" ]; then
+          echo "db-backup: DB_PASSWORD is required" >&2
+          exit 1
+        fi
+        if [ -z "$RCLONE_CONFIG" ]; then
+          echo "db-backup: RCLONE_CONFIG is required" >&2
+          exit 1
+        fi
+
+    - name: Write rclone config
+      id: rclone
+      shell: bash
+      run: |
+        file=$(mktemp)
+        chmod 600 "$file"
+        echo "path=$file" >> "$GITHUB_OUTPUT"
+        printf '%s' "$RCLONE_CONFIG" > "$file"
+
+    - name: Build image
+      shell: bash
+      run: |
+        root="${{ github.action_path }}/../../.."
+        docker build -t db-backup:local -f "$root/Dockerfile" "$root"
+
+    - name: Run backup
+      shell: bash
+      env:
+        BACKUP_HOST: ${{ inputs.host }}
+        BACKUP_USER: ${{ inputs.user }}
+        BACKUP_DATABASE: ${{ inputs.database }}
+        BACKUP_REMOTE: ${{ inputs.remote }}
+        BACKUP_PREFIX: ${{ inputs.prefix }}
+        BACKUP_KEEP: ${{ inputs.keep }}
+      run: |
+        path="${{ steps.rclone.outputs.path }}"
+        exec docker run --rm \
+          -e DB_PASSWORD \
+          -e RCLONE_CONFIG=/tmp/rclone.conf \
+          -v "$path:/tmp/rclone.conf:ro" \
+          db-backup:local \
+          --driver mysql \
+          --host "$BACKUP_HOST" \
+          --user "$BACKUP_USER" \
+          --database "$BACKUP_DATABASE" \
+          --remote "$BACKUP_REMOTE" \
+          --prefix "$BACKUP_PREFIX" \
+          --keep "$BACKUP_KEEP"
+
+    - name: Remove rclone config
+      if: always()
+      shell: bash
+      run: |
+        path="${{ steps.rclone.outputs.path }}"
+        if [ -z "$path" ]; then
+          exit 0
+        fi
+        rm -f -- "$path"
