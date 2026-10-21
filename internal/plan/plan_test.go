@@ -34,6 +34,7 @@ func TestBuildMySQLDumpAndObject(t *testing.T) {
 		"--single-transaction",
 		"--routines",
 		"--triggers",
+		"--column-statistics=0",
 		"app",
 	}
 	if !reflect.DeepEqual(p.MySQLDump, wantDump) {

@@ -38,6 +38,7 @@ func Build(opts cli.Options, now time.Time, defaultsPath string) (Pipeline, erro
 			"--single-transaction",
 			"--routines",
 			"--triggers",
+			"--column-statistics=0",
 			opts.Database,
 		},
 		DefaultsFile: []byte("[client]\npassword=\"" + escaped + "\"\n"),
