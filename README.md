@@ -2,7 +2,7 @@
 
 ## O que faz
 
-O `db-backup` faz dump de um MySQL, comprime com gzip, faz upload por um rclone já configurado e aplica retenção por idade. Só MySQL nesta v1.
+O `db-backup` faz dump de um MySQL, comprime com gzip, faz upload ao Cloud Storage com ADC e aplica retenção por idade. Só MySQL. Sem rclone e sem Drive.
 
 ## Build
 
@@ -18,84 +18,47 @@ docker build -t db-backup .
 
 ```bash
 docker run --rm \
-  -e DB_PASSWORD \
-  -e RCLONE_CONFIG=/config/rclone.conf \
-  -v /path/to/rclone.conf:/config/rclone.conf:ro \
+  -e MYSQL_PASSWORD \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcp.json \
+  -v /path/to/gcp.json:/secrets/gcp.json:ro \
   db-backup \
   --driver mysql \
   --host HOST \
   --user USER \
   --database DB \
-  --remote drive:Venko/backups \
+  --bucket BUCKET \
   --prefix venko \
   --keep 30
 ```
 
-`DB_PASSWORD` vem do ambiente. Não coloque senha real na linha de comando. O volume do `rclone.conf` é somente leitura. `localhost` dentro do container é o container, não a máquina hospedeira: `--host` precisa ser alcançável a partir do container.
+`MYSQL_PASSWORD` vem do ambiente. Não colocar senha real na linha de comando. O volume da credencial é somente leitura. `localhost` dentro do container é o container, não a máquina hospedeira: `--host` precisa ser alcançável a partir do container. No Cloud Run Job a credencial de arquivo não é usada; vale a service account do serviço.
 
-## Action
+Flag presente ganha da env correspondente (`MYSQL_HOST`, `MYSQL_USER`, `MYSQL_DATABASE`, `GCS_BUCKET`, `BACKUP_PREFIX`, `MYSQL_PASSWORD`).
 
-A Action builda a imagem a cada run e não faz pull de registry. `RCLONE_CONFIG` no secret é o conteúdo do `rclone.conf`, não um caminho.
+## Cloud Run Job
 
-Os cinco inputs obrigatórios são `host`, `user`, `database`, `remote` e `prefix`. `keep` é opcional.
+Documentar, não aplicar.
 
-```yaml
-- uses: leogsouza/db-backup/.github/actions/backup@<ref>
-  with:
-    host: HOST
-    user: USER
-    database: DB
-    remote: drive:Venko/backups
-    prefix: venko
-    keep: "30"
-  env:
-    DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-    RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+```bash
+gcloud run jobs deploy venko-mysql-backup \
+  --region southamerica-east1 \
+  --image IMAGE \
+  --service-account SA \
+  --set-env-vars MYSQL_HOST,MYSQL_USER,MYSQL_DATABASE,GCS_BUCKET,BACKUP_PREFIX \
+  --set-secrets MYSQL_PASSWORD=... \
+  --args=--driver,mysql,--host,...,--bucket,...,--prefix,venko,--keep,30
 ```
+
+O operador substitui `IMAGE`, `SA`, `...` e o recurso do secret, e um `--set-env-vars` real usa `KEY=VALUE`.
+
+A service account do job precisa criar, listar e apagar objetos no bucket. Sem `RCLONE_CONFIG`.
+
+## Cloud Scheduler
+
+Um job só, cron `0 11,15,19,23 * * *` (08, 12, 16, 20 BRT), chama o Cloud Run Job `venko-mysql-backup`. Não criar quatro jobs de Scheduler para os quatro horários. Três jobs de Scheduler são grátis na conta; este desenho usa um. Documentar, não aplicar. Sem Terraform. O nome do objeto continua UTC, não BRT.
 
 ## Restore
 
 ```bash
 gunzip -c arquivo.sql.gz | mysql -h HOST -u USER -p DB
-```
-
-## Cron
-
-A expressão é UTC. O comentário é BRT. O nome do objeto também é UTC, não BRT: `{prefix}-YYYYMMDD-HHMM.sql.gz`.
-
-```bash
-0 11,15,19,23 * * * docker run --rm -e DB_PASSWORD -e RCLONE_CONFIG=/config/rclone.conf -v /path/to/rclone.conf:/config/rclone.conf:ro db-backup --driver mysql --host HOST --user USER --database DB --remote drive:Venko/backups --prefix venko --keep 30
-# 08, 12, 16, 20 BRT
-```
-
-## Storage
-
-Quatro remotes, só configuração. Não há cliente de Drive, Google Cloud Storage, S3 nem B2 neste repositório. Gere o resto com `rclone config`. Os blocos não têm token real.
-
-Google Drive (`drive`). `--remote gdrive:Venko/backups`
-
-```ini
-[gdrive]
-type = drive
-```
-
-Google Cloud Storage (`google cloud storage`). `--remote gcs:bucket/backups`
-
-```ini
-[gcs]
-type = google cloud storage
-```
-
-S3 (`s3`). `--remote s3:bucket/backups`
-
-```ini
-[s3]
-type = s3
-```
-
-Backblaze B2 (`b2`). `--remote b2:bucket/backups`
-
-```ini
-[b2]
-type = b2
 ```
