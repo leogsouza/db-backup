@@ -12,8 +12,7 @@ RUN set -eux; \
         ca-certificates \
         gzip \
         gnupg \
-        wget \
-        unzip; \
+        wget; \
     rm -rf /var/lib/apt/lists/*
 
 # Same key as MySQL 8.0.36+ (BCA43417C3B485DD128EC6D4B7B3B788A8D3785C).
@@ -32,12 +31,6 @@ RUN set -eux; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends mysql-community-client; \
     rm -rf /var/lib/apt/lists/*
-
-RUN set -eux; \
-    wget -qO /tmp/rclone.zip https://github.com/rclone/rclone/releases/download/v1.75.2/rclone-v1.75.2-linux-amd64.zip; \
-    unzip -j /tmp/rclone.zip rclone-v1.75.2-linux-amd64/rclone -d /usr/local/bin; \
-    chmod 755 /usr/local/bin/rclone; \
-    rm -f /tmp/rclone.zip
 
 COPY --from=build /usr/local/bin/db-backup /usr/local/bin/db-backup
 
