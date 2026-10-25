@@ -1,7 +1,6 @@
 package run
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,23 +13,27 @@ import (
 	"syscall"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/leogsouza/db-backup/internal/cli"
 	"github.com/leogsouza/db-backup/internal/plan"
+	"google.golang.org/api/iterator"
 )
 
 const (
 	stageMySQLDump = "mysqldump"
 	stageGzip      = "gzip"
-	stageRclone    = "rclone rcat"
+	stageUpload    = "upload"
 )
 
 func backupFailed() error {
 	return errors.New("db-backup: backup falhou")
 }
 
-// Execute runs mysqldump, gzip, and rclone rcat, then retention.
-// A pipeline or signal failure returns exactly errors.New("db-backup: backup falhou").
-// Retention failure is logged and returns nil. Success writes nothing.
+// Execute runs mysqldump and gzip into a temp file, uploads that file, then retention.
+// A pipeline, upload, or signal failure returns exactly errors.New("db-backup: backup falhou").
+// A retention list or delete failure is logged and does not fail the backup.
+// Cancellation during retention deletes this run's object and fails the backup.
+// Success writes nothing.
 // Execute is the only production caller of retentionAllowed and mustDeletePartial.
 func Execute(ctx context.Context, opts cli.Options) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
@@ -61,83 +64,133 @@ func Execute(ctx context.Context, opts cli.Options) error {
 		return backupFailed()
 	}
 
-	result := runPipeline(ctx, pl)
-	pipelineOK := result.exitZero() && ctx.Err() == nil
+	gzipFile, err := os.CreateTemp("", "db-backup-*.sql.gz")
+	if err != nil {
+		return backupFailed()
+	}
+	defer os.Remove(gzipFile.Name())
+	defer gzipFile.Close()
 
-	// Failure deletes this run's object and does not call SelectExpired.
-	if mustDeletePartial(pipelineOK) {
+	result := runPipeline(ctx, pl, gzipFile)
+	// No storage client and no object delete unless dump and gzip exited 0
+	// and the run was not canceled. A failed dump must not create an object.
+	if !uploadAllowed(result.dump.exitZero(), result.gzip.exitZero(), ctx.Err() != nil) {
 		result.logFailures(opts.Password)
-		deletePartial(ctx, pl.Object, opts.Password)
 		return backupFailed()
 	}
-	// A signal after the three processes exited 0 is not success.
+
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		logUploadFailed(err.Error(), opts.Password)
+		return backupFailed()
+	}
+	defer client.Close()
+
+	if err := gzipFile.Close(); err != nil {
+		logUploadFailed(err.Error(), opts.Password)
+		return backupFailed()
+	}
+	src, err := os.Open(gzipFile.Name())
+	if err != nil {
+		logUploadFailed(err.Error(), opts.Password)
+		return backupFailed()
+	}
+	defer src.Close()
+
+	// NewWriter does not return an error. A nil writer was not opened: do not
+	// Close it and do not delete. ContentType and Metadata stay unset.
+	w := client.Bucket(pl.Bucket).Object(pl.Object).NewWriter(ctx)
+	writerOpened := w != nil
+	var copyErr, closeErr error
+	if writerOpened {
+		_, copyErr = io.Copy(w, src)
+		closeErr = w.Close()
+	} else {
+		copyErr = errors.New("storage: NewWriter não devolveu writer")
+	}
+	uploadOK := uploadSucceeded(copyErr, closeErr, ctx.Err() != nil)
+	if !uploadOK {
+		logUploadFailed(uploadFailureDetail(copyErr, closeErr, ctx.Err()), opts.Password)
+		if mustDeletePartial(false) && shouldDeleteObject(writerOpened, false) {
+			deleteRunObject(ctx, client, pl.Bucket, pl.Object, opts.Password)
+		}
+		return backupFailed()
+	}
+	// Cancel after a successful upload is not covered by shouldDeleteObject(true, true),
+	// which is false. Delete this run's object anyway.
 	if ctx.Err() != nil {
-		deletePartial(ctx, pl.Object, opts.Password)
+		deleteRunObject(ctx, client, pl.Bucket, pl.Object, opts.Password)
 		return backupFailed()
 	}
-	if retentionAllowed(pipelineOK) {
-		if err := retain(ctx, opts, now); err != nil {
-			deletePartial(ctx, pl.Object, opts.Password)
+	if retentionAllowed(true) {
+		if err := retain(ctx, client, opts, now, pl.Bucket, pl.Object, opts.Password); err != nil {
+			deleteRunObject(ctx, client, pl.Bucket, pl.Object, opts.Password)
 			return backupFailed()
 		}
 	}
 	return nil
 }
 
-func deletePartial(ctx context.Context, object, password string) {
-	args := plan.DeleteArgs(object)
-	// The signal that failed the backup must not abort the cleanup delete.
-	cmd := exec.CommandContext(context.WithoutCancel(ctx), args[0], args[1:]...)
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintln(os.Stderr, Redact("db-backup: falha ao apagar objeto parcial: "+err.Error(), password))
+// deleteRunObject removes this run's object. The signal that failed the backup
+// must not abort the cleanup delete. A delete failure does not change the exit.
+func deleteRunObject(ctx context.Context, client *storage.Client, bucket, object, password string) {
+	err := client.Bucket(bucket).Object(object).Delete(context.WithoutCancel(ctx))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, partialDeleteLog(err.Error(), password))
 	}
 }
 
-// retain lists the remote and deletes expired names. It returns a non-nil
-// error only when ctx is canceled, so the caller can delete this run's object.
-// A list or delete failure is logged and does not fail the backup.
-func retain(ctx context.Context, opts cli.Options, now time.Time) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	listArgs := plan.ListArgs(opts.Remote)
-	cmd := exec.CommandContext(ctx, listArgs[0], listArgs[1:]...)
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		fmt.Fprintln(os.Stderr, Redact("db-backup: retenção: falha ao listar: "+err.Error(), opts.Password))
-		return nil
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
+func logUploadFailed(detail, password string) {
+	logStageFailed(stageUpload, detail, password)
+}
 
-	var names []string
-	for _, line := range strings.Split(stdout.String(), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		names = append(names, line)
+func uploadFailureDetail(copyErr, closeErr, ctxErr error) string {
+	var parts []string
+	if copyErr != nil {
+		parts = append(parts, copyErr.Error())
 	}
-	current := opts.Prefix + "-" + now.Format("20060102-1504") + ".sql.gz"
-	expired := plan.SelectExpired(names, opts.Prefix, now, opts.KeepDays, current)
-	dir := plan.RemoteDir(opts.Remote)
-	for _, name := range expired {
-		if err := ctx.Err(); err != nil {
-			return err
+	if closeErr != nil && (copyErr == nil || closeErr.Error() != copyErr.Error()) {
+		parts = append(parts, closeErr.Error())
+	}
+	if len(parts) == 0 && ctxErr != nil {
+		parts = append(parts, ctxErr.Error())
+	}
+	return strings.Join(parts, "\n")
+}
+
+// retain lists objects under prefix- and deletes expired names. It returns a
+// non-nil error only when ctx is canceled, so the caller can delete this run's
+// object. A list or delete failure is logged and does not fail the backup.
+func retain(ctx context.Context, client *storage.Client, opts cli.Options, now time.Time, bucket, object, password string) error {
+	it := client.Bucket(bucket).Objects(ctx, &storage.Query{Prefix: opts.Prefix + "-"})
+	var names []string
+	for {
+		attrs, err := it.Next()
+		if err == iterator.Done {
+			break
 		}
-		object := plan.Join(dir, name)
-		delArgs := plan.DeleteArgs(object)
-		del := exec.CommandContext(ctx, delArgs[0], delArgs[1:]...)
-		if err := del.Run(); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
+		if err != nil {
+			outcome := retainOutcome(ctx.Err(), err)
+			if outcome != nil {
+				return outcome
 			}
-			fmt.Fprintln(os.Stderr, Redact("db-backup: retenção: falha ao apagar "+object+": "+err.Error(), opts.Password))
+			fmt.Fprintln(os.Stderr, retentionListLog(err, password))
+			return nil
+		}
+		names = append(names, attrs.Name)
+	}
+	expired := plan.SelectExpired(names, opts.Prefix, now, opts.KeepDays, object)
+	for _, name := range expired {
+		if outcome := retainOutcome(ctx.Err(), nil); outcome != nil {
+			return outcome
+		}
+		err := client.Bucket(bucket).Object(name).Delete(ctx)
+		if err != nil {
+			outcome := retainOutcome(ctx.Err(), err)
+			if outcome != nil {
+				return outcome
+			}
+			fmt.Fprintln(os.Stderr, retentionDeleteLog(bucket, name, err, password))
 			continue
 		}
 	}
@@ -168,7 +221,7 @@ func newStage(ctx context.Context, name string, args []string) *stage {
 	}
 	s.stderrFile = f
 	// Env stays nil so the child inherits the process environment.
-	// RCLONE_CONFIG is not read or rewritten. Argv is not logged.
+	// Argv is not logged.
 	s.cmd = exec.CommandContext(ctx, args[0], args[1:]...)
 	s.cmd.Stderr = f
 	return s
@@ -241,17 +294,16 @@ func reapKilled(s *stage) {
 }
 
 type pipelineResult struct {
-	dump, gzip, rclone *stage
+	dump, gzip *stage
 }
 
 func (r pipelineResult) exitZero() bool {
-	return r.dump.exitZero() && r.gzip.exitZero() && r.rclone.exitZero()
+	return r.dump.exitZero() && r.gzip.exitZero()
 }
 
 func (r pipelineResult) logFailures(password string) {
 	r.dump.logFailure(password)
 	r.gzip.logFailure(password)
-	r.rclone.logFailure(password)
 }
 
 // writePipe is a pipe whose write end the parent closes. os.Pipe is used
@@ -295,15 +347,13 @@ func (p *writePipe) close() {
 	p.closeWrite()
 }
 
-func runPipeline(ctx context.Context, pl plan.Pipeline) pipelineResult {
+func runPipeline(ctx context.Context, pl plan.Pipeline, out *os.File) pipelineResult {
 	dump := newStage(ctx, stageMySQLDump, pl.MySQLDump)
 	gzip := newStage(ctx, stageGzip, pl.Gzip)
-	rclone := newStage(ctx, stageRclone, pl.RcloneRcat)
 	defer dump.finishStderr()
 	defer gzip.finishStderr()
-	defer rclone.finishStderr()
-	result := pipelineResult{dump: dump, gzip: gzip, rclone: rclone}
-	if dump.cmd == nil || gzip.cmd == nil || rclone.cmd == nil {
+	result := pipelineResult{dump: dump, gzip: gzip}
+	if dump.cmd == nil || gzip.cmd == nil {
 		return result
 	}
 
@@ -313,35 +363,18 @@ func runPipeline(ctx context.Context, pl plan.Pipeline) pipelineResult {
 		return result
 	}
 	defer dumpToGzip.close()
-	gzipToRclone, err := newWritePipe()
-	if err != nil {
-		dump.startErr = err
-		return result
-	}
-	defer gzipToRclone.close()
 
 	dump.cmd.Stdout = dumpToGzip.w
 	gzip.cmd.Stdin = dumpToGzip.r
-	gzip.cmd.Stdout = gzipToRclone.w
-	rclone.cmd.Stdin = gzipToRclone.r
+	gzip.cmd.Stdout = out
 
 	closeWrites := func() {
 		dumpToGzip.closeWrite()
-		gzipToRclone.closeWrite()
 	}
 
-	// Start consumers first so a writer cannot fill a pipe with no reader.
-	if err := rclone.cmd.Start(); err != nil {
-		rclone.startErr = err
-		return result
-	}
-	rclone.started = true
-	gzipToRclone.closeRead()
-
+	// Start the consumer first so a writer cannot fill a pipe with no reader.
 	if err := gzip.cmd.Start(); err != nil {
 		gzip.startErr = err
-		closeWrites()
-		reapKilled(rclone)
 		return result
 	}
 	gzip.started = true
@@ -351,14 +384,12 @@ func runPipeline(ctx context.Context, pl plan.Pipeline) pipelineResult {
 		dump.startErr = err
 		closeWrites()
 		reapKilled(gzip)
-		reapKilled(rclone)
 		return result
 	}
 	dump.started = true
 
 	dumpDone := make(chan error, 1)
 	gzipDone := make(chan error, 1)
-	rcloneDone := make(chan error, 1)
 	go func() {
 		err := dump.cmd.Wait()
 		dumpToGzip.closeWrite()
@@ -366,20 +397,15 @@ func runPipeline(ctx context.Context, pl plan.Pipeline) pipelineResult {
 	}()
 	go func() {
 		err := gzip.cmd.Wait()
-		gzipToRclone.closeWrite()
 		gzipDone <- err
 	}()
-	go func() {
-		rcloneDone <- rclone.cmd.Wait()
-	}()
 
-	var dumpReaped, gzipReaped, rcloneReaped bool
+	var dumpReaped, gzipReaped bool
 	failed := false
 	cancelCh := ctx.Done()
 	killStraggler := func() {
-		// On success rclone may still be uploading after dump and gzip exit.
 		// SIGKILL is only for a process that is still running after a failure
-		// or cancel once the other two have been waited.
+		// or cancel once the other has been waited.
 		if !failed && ctx.Err() == nil {
 			return
 		}
@@ -395,12 +421,7 @@ func runPipeline(ctx context.Context, pl plan.Pipeline) pipelineResult {
 		} else {
 			running = gzip
 		}
-		if rcloneReaped {
-			finished++
-		} else {
-			running = rclone
-		}
-		if finished == 2 && running != nil {
+		if finished == 1 && running != nil {
 			running.kill()
 		}
 	}
@@ -409,7 +430,7 @@ func runPipeline(ctx context.Context, pl plan.Pipeline) pipelineResult {
 		closeWrites()
 	}
 
-	for !dumpReaped || !gzipReaped || !rcloneReaped {
+	for !dumpReaped || !gzipReaped {
 		select {
 		case err := <-dumpDone:
 			dump.waitErr = err
@@ -423,14 +444,6 @@ func runPipeline(ctx context.Context, pl plan.Pipeline) pipelineResult {
 			gzip.waitErr = err
 			gzip.reaped = true
 			gzipReaped = true
-			if err != nil {
-				markFailed()
-			}
-			killStraggler()
-		case err := <-rcloneDone:
-			rclone.waitErr = err
-			rclone.reaped = true
-			rcloneReaped = true
 			if err != nil {
 				markFailed()
 			}
