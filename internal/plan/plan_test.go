@@ -14,7 +14,7 @@ var now = time.Date(2026, 10, 19, 23, 15, 0, 0, time.UTC)
 func testOpts() cli.Options {
 	return cli.Options{
 		Driver: "mysql", Host: "db.example", Port: 3306, User: "u",
-		Password: "p\"a\\b", Database: "app", Remote: "drive:Venko/backups",
+		Password: "p\"a\\b", Database: "app", Bucket: "backups",
 		Prefix: "venko", KeepDays: 30,
 	}
 }
@@ -43,14 +43,15 @@ func TestBuildMySQLDumpAndObject(t *testing.T) {
 	if !reflect.DeepEqual(p.Gzip, []string{"gzip"}) {
 		t.Fatalf("%#v", p.Gzip)
 	}
-	if !reflect.DeepEqual(p.RcloneRcat, []string{"rclone", "rcat", "drive:Venko/backups/venko-20261019-2315.sql.gz"}) {
-		t.Fatalf("%#v", p.RcloneRcat)
+	if p.Bucket != "backups" {
+		t.Fatal(p.Bucket)
 	}
-	if p.Object != "drive:Venko/backups/venko-20261019-2315.sql.gz" {
+	if p.Object != "venko-20261019-2315.sql.gz" {
 		t.Fatal(p.Object)
 	}
-	if strings.Contains(strings.Join(append(append(p.MySQLDump, p.Gzip...), p.RcloneRcat...), "\n"), `p"a\b`) {
-		t.Fatal("password in argv")
+	joined := strings.Join(append(p.MySQLDump, p.Gzip...), "\n")
+	if strings.Contains(joined, `p"a\b`) || strings.Contains(joined, "rclone") {
+		t.Fatal(joined)
 	}
 	if string(p.DefaultsFile) != "[client]\npassword=\"p\\\"a\\\\b\"\n" {
 		t.Fatalf("%q", p.DefaultsFile)
@@ -75,29 +76,9 @@ func TestBuildRejectsEmptyDefaultsPath(t *testing.T) {
 	}
 }
 
-func TestJoinRemote(t *testing.T) {
-	name := "venko-20261019-2315.sql.gz"
-	if Join("drive:Venko/backups", name) != "drive:Venko/backups/"+name {
-		t.Fatal(Join("drive:Venko/backups", name))
-	}
-	if Join("drive:Venko/backups/", name) != "drive:Venko/backups/"+name {
-		t.Fatal("trailing slash")
-	}
-	if Join("drive:", name) != "drive:"+name {
-		t.Fatal(Join("drive:", name))
-	}
-}
-
-func TestListAndDeleteArgs(t *testing.T) {
-	if !reflect.DeepEqual(ListArgs("drive:Venko/backups/"), []string{"rclone", "lsf", "--files-only", "drive:Venko/backups"}) {
-		t.Fatal(ListArgs("drive:Venko/backups/"))
-	}
-	if !reflect.DeepEqual(ListArgs("drive:"), []string{"rclone", "lsf", "--files-only", "drive:"}) {
-		t.Fatal(ListArgs("drive:"))
-	}
-	object := "drive:venko-20261019-2315.sql.gz"
-	if !reflect.DeepEqual(DeleteArgs(object), []string{"rclone", "deletefile", object}) {
-		t.Fatal(DeleteArgs(object))
+func TestObjectName(t *testing.T) {
+	if ObjectName("venko", now) != "venko-20261019-2315.sql.gz" {
+		t.Fatal(ObjectName("venko", now))
 	}
 }
 

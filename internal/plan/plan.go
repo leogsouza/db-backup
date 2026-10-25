@@ -15,18 +15,21 @@ type Pipeline struct {
 	MySQLDump    []string
 	DefaultsFile []byte
 	Gzip         []string
-	RcloneRcat   []string
+	Bucket       string
 	Object       string
 }
 
-// Build plans mysqldump, gzip, and rclone rcat. It returns an error only when
-// defaultsPath is empty and does not revalidate opts.
+// ObjectName returns prefix-YYYYMMDD-HHMM.sql.gz using now in UTC.
+func ObjectName(prefix string, now time.Time) string {
+	return prefix + "-" + now.UTC().Format("20060102-1504") + ".sql.gz"
+}
+
+// Build plans mysqldump, gzip, and the bucket object name. It returns an error
+// only when defaultsPath is empty and does not revalidate opts.
 func Build(opts cli.Options, now time.Time, defaultsPath string) (Pipeline, error) {
 	if defaultsPath == "" {
 		return Pipeline{}, errors.New("plan: defaults path is required")
 	}
-	stamp := now.UTC().Format("20060102-1504")
-	object := Join(opts.Remote, opts.Prefix+"-"+stamp+".sql.gz")
 	escaped := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(opts.Password)
 	return Pipeline{
 		MySQLDump: []string{
@@ -43,34 +46,9 @@ func Build(opts cli.Options, now time.Time, defaultsPath string) (Pipeline, erro
 		},
 		DefaultsFile: []byte("[client]\npassword=\"" + escaped + "\"\n"),
 		Gzip:         []string{"gzip"},
-		RcloneRcat:   []string{"rclone", "rcat", object},
-		Object:       object,
+		Bucket:       opts.Bucket,
+		Object:       ObjectName(opts.Prefix, now),
 	}, nil
-}
-
-// RemoteDir removes trailing slashes. "drive:" is left unchanged.
-func RemoteDir(remote string) string {
-	return strings.TrimRight(remote, "/")
-}
-
-// Join appends name to a remote. A directory ending in ":" is concatenated
-// directly; otherwise a slash separates the parts. path.Join is not used.
-func Join(remote, name string) string {
-	dir := RemoteDir(remote)
-	if strings.HasSuffix(dir, ":") {
-		return dir + name
-	}
-	return dir + "/" + name
-}
-
-// ListArgs returns rclone lsf --files-only arguments for the remote directory.
-func ListArgs(remote string) []string {
-	return []string{"rclone", "lsf", "--files-only", RemoteDir(remote)}
-}
-
-// DeleteArgs returns rclone deletefile arguments for an already joined object.
-func DeleteArgs(object string) []string {
-	return []string{"rclone", "deletefile", object}
 }
 
 // SelectExpired returns input names older than keepDays, in input order.
