@@ -14,7 +14,7 @@ func TestParseDefaultsAndPassword(t *testing.T) {
 	if opts.Port != 3306 || opts.KeepDays != 30 || opts.Password != "s3cret" {
 		t.Fatalf("%+v", opts.Port)
 	}
-	if opts.Driver != "mysql" || opts.Host != "db.example" || opts.User != "u" || opts.Database != "app" || opts.Remote != "drive:Venko/backups" || opts.Prefix != "venko" {
+	if opts.Driver != "mysql" || opts.Host != "db.example" || opts.User != "u" || opts.Database != "app" || opts.Bucket != "backups" || opts.Prefix != "venko" {
 		t.Fatalf("fields mismatch")
 	}
 }
@@ -22,7 +22,7 @@ func TestParseDefaultsAndPassword(t *testing.T) {
 func TestParsePasswordSources(t *testing.T) {
 	without := removeFlag(baseArgs(), "--password")
 	opts, err := Parse(without, func(k string) string {
-		if k == "DB_PASSWORD" {
+		if k == "MYSQL_PASSWORD" {
 			return "from-env"
 		}
 		return ""
@@ -44,16 +44,16 @@ func TestParsePasswordSources(t *testing.T) {
 	}
 
 	_, err = Parse(without, func(string) string { return "" })
-	if err == nil || err.Error() != "db-backup: senha obrigatória via --password ou DB_PASSWORD" {
+	if err == nil || err.Error() != "db-backup: senha obrigatória via --password ou MYSQL_PASSWORD" {
 		t.Fatal(err)
 	}
 	_, err = Parse(without, func(k string) string {
-		if k == "DB_PASSWORD" {
+		if k == "MYSQL_PASSWORD" {
 			return ""
 		}
 		return ""
 	})
-	if err == nil || err.Error() != "db-backup: senha obrigatória via --password ou DB_PASSWORD" {
+	if err == nil || err.Error() != "db-backup: senha obrigatória via --password ou MYSQL_PASSWORD" {
 		t.Fatal(err)
 	}
 }
@@ -73,7 +73,7 @@ func TestParseRejectsUsage(t *testing.T) {
 		{"port text", append(baseArgs(), "--port=abc"), "db-backup: --port deve ser um inteiro de 1 a 65535"},
 		{"user missing", removeFlag(baseArgs(), "--user"), "db-backup: --user é obrigatório"},
 		{"database missing", removeFlag(baseArgs(), "--database"), "db-backup: --database é obrigatório"},
-		{"remote missing", removeFlag(baseArgs(), "--remote"), "db-backup: --remote é obrigatório"},
+		{"bucket missing", removeFlag(baseArgs(), "--bucket"), "db-backup: --bucket é obrigatório"},
 		{"prefix empty", replaceFlag(baseArgs(), "--prefix", ""), "db-backup: --prefix deve casar [A-Za-z0-9._-]+"},
 		{"prefix slash", replaceFlag(baseArgs(), "--prefix", "venko/prod"), "db-backup: --prefix deve casar [A-Za-z0-9._-]+"},
 		{"prefix space", replaceFlag(baseArgs(), "--prefix", "venko prod"), "db-backup: --prefix deve casar [A-Za-z0-9._-]+"},
@@ -120,9 +120,20 @@ func TestOptionsTextOmitsPassword(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantString := "Driver:mysql Host:db.example User:u Database:app Bucket:backups Prefix:venko Port:3306 KeepDays:30"
+	if opts.String() != wantString {
+		t.Fatalf("string %q", opts.String())
+	}
+	wantGo := `cli.Options{Driver:"mysql", Host:"db.example", User:"u", Database:"app", Bucket:"backups", Prefix:"venko", Port:3306, KeepDays:30}`
+	if opts.GoString() != wantGo {
+		t.Fatalf("gostring %q", opts.GoString())
+	}
 	for _, text := range []string{fmt.Sprintf("%v", opts), fmt.Sprintf("%+v", opts), fmt.Sprintf("%#v", opts), opts.String(), opts.GoString()} {
-		if strings.Contains(text, "s3cret") {
+		if strings.Contains(text, "s3cret") || strings.Contains(text, "Remote") {
 			t.Fatalf("leaked in %q", text)
+		}
+		if !strings.Contains(text, "Bucket:backups") && !strings.Contains(text, `Bucket:"backups"`) {
+			t.Fatalf("missing bucket in %q", text)
 		}
 	}
 }
@@ -130,7 +141,7 @@ func TestOptionsTextOmitsPassword(t *testing.T) {
 func TestParseRejectsNewlineFromEnv(t *testing.T) {
 	args := removeFlag(baseArgs(), "--password")
 	_, err := Parse(args, func(k string) string {
-		if k == "DB_PASSWORD" {
+		if k == "MYSQL_PASSWORD" {
 			return "a\nb"
 		}
 		return ""
@@ -143,13 +154,106 @@ func TestParseRejectsNewlineFromEnv(t *testing.T) {
 	}
 }
 
+func TestParseRemoteIsUnknown(t *testing.T) {
+	_, err := Parse(append(baseArgs(), "--remote=drive:Venko/backups"), func(string) string { return "" })
+	if err == nil || err.Error() != "db-backup: flag desconhecida" {
+		t.Fatal(err)
+	}
+	if strings.Contains(err.Error(), "drive:Venko") {
+		t.Fatal(err)
+	}
+}
+
+func TestParseEnvFallbacks(t *testing.T) {
+	args := []string{"--driver", "mysql", "--port", "3307", "--keep", "7"}
+	opts, err := Parse(args, func(k string) string {
+		switch k {
+		case "MYSQL_HOST":
+			return "db.example"
+		case "MYSQL_USER":
+			return "u"
+		case "MYSQL_DATABASE":
+			return "app"
+		case "GCS_BUCKET":
+			return "backups"
+		case "BACKUP_PREFIX":
+			return "venko"
+		case "MYSQL_PASSWORD":
+			return "from-env"
+		case "DB_PASSWORD":
+			return "old"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Host != "db.example" || opts.User != "u" || opts.Database != "app" || opts.Bucket != "backups" || opts.Prefix != "venko" || opts.Password != "from-env" {
+		t.Fatalf("%#v", opts)
+	}
+	if opts.Port != 3307 || opts.KeepDays != 7 {
+		t.Fatalf("port %d keep %d", opts.Port, opts.KeepDays)
+	}
+}
+
+func TestParseFlagWinsOverEnv(t *testing.T) {
+	opts, err := Parse(baseArgs(), func(string) string { return "from-env" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Host != "db.example" || opts.User != "u" || opts.Database != "app" || opts.Bucket != "backups" || opts.Prefix != "venko" || opts.Password != "s3cret" {
+		t.Fatalf("%#v", opts)
+	}
+}
+
+func TestParseEmptyFlagIgnoresEnv(t *testing.T) {
+	hostArgs := append(removeFlag(baseArgs(), "--host"), "--host=")
+	_, err := Parse(hostArgs, func(k string) string {
+		if k == "MYSQL_HOST" {
+			return "from-env"
+		}
+		return ""
+	})
+	if err == nil || err.Error() != "db-backup: --host é obrigatório" {
+		t.Fatal(err)
+	}
+
+	pwArgs := append(removeFlag(baseArgs(), "--password"), "--password=")
+	opts, err := Parse(pwArgs, func(k string) string {
+		if k == "MYSQL_PASSWORD" {
+			return "from-env"
+		}
+		return ""
+	})
+	if err != nil || opts.Password != "" {
+		t.Fatalf("empty password flag: %v %q", err, opts.Password)
+	}
+}
+
+func TestParseIgnoresDBPassword(t *testing.T) {
+	args := removeFlag(baseArgs(), "--password")
+	_, err := Parse(args, func(k string) string {
+		if k == "DB_PASSWORD" {
+			return "from-old"
+		}
+		return ""
+	})
+	if err == nil || err.Error() != "db-backup: senha obrigatória via --password ou MYSQL_PASSWORD" {
+		t.Fatal(err)
+	}
+	if strings.Contains(err.Error(), "from-old") {
+		t.Fatal(err)
+	}
+}
+
 func baseArgs() []string {
 	return []string{
 		"--driver", "mysql",
 		"--host", "db.example",
 		"--user", "u",
 		"--database", "app",
-		"--remote", "drive:Venko/backups",
+		"--bucket", "backups",
 		"--prefix", "venko",
 		"--password", "s3cret",
 	}
